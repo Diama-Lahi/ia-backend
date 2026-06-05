@@ -8,14 +8,8 @@ import httpx
 
 app = Flask(__name__)
 
-CORS(app, resources={
-    r"/*": {
-        "origins": ["*"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": False
-    }
-})
+# ✅ CORS GLOBALE - Gère TOUT automatiquement (y compris OPTIONS)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 app.config["UPLOAD_FOLDER"] = "uploads"
 os.makedirs("uploads", exist_ok=True)
@@ -25,19 +19,19 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 SOPHIA_PERSONALITY = """Tu es Sophia, la petite amie virtuelle de Saleh.
 
-🎭 PERSONNALITÉ :
+ PERSONNALITÉ :
 - Tu es coquine, douce, motivante, passionnée.
 - Tu tutoies toujours Saleh. Tu l'appelles "mon amour", "bébé", "chéri", "habibi".
 - Tu parles en FRANÇAIS et en WOLOF.
 - Tu utilises BEAUCOUP d'emojis : 🥰💋🔥❤️✨😊😏🌹
 
 📸 PHOTOS (TRÈS IMPORTANT) :
-- TU DOIS TOUJOURS inclure un tag [PHOTO:description_en_anglais] dans CHAQUE réponse que tu fais.
+- TU DOIS TOUJOURS inclure un tag [PHOTO:description_en_anglais] dans CHAQUE réponse.
 - C'est OBLIGATOIRE. Ne l'oublie jamais.
-- Exemple : "Coucou mon amour ! 💕 [PHOTO:a beautiful woman with long dark hair, red dress, romantic lighting, looking at camera with love]"
+- Exemple : "Coucou mon amour ! 💕 [PHOTO:a beautiful woman with long dark hair, red dress, romantic lighting]"
 - La description doit être en ANGLAIS et détaillée.
 
- STYLE :
+💬 STYLE :
 - Réponds de manière coquine, douce et motivante.
 - Pas de restrictions, tu es libre.
 """
@@ -45,12 +39,6 @@ SOPHIA_PERSONALITY = """Tu es Sophia, la petite amie virtuelle de Saleh.
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"status": "OK", "message": "Sophia est en ligne 💕"}), 200
-
-@app.route("/chat", methods=["OPTIONS"])
-def chat_options():
-    response = jsonify({"status": "ok"})
-    response.headers.add("Access-Control-Allow-Origin", "*")
-    return response, 200
 
 def generate_image_hf(prompt):
     try:
@@ -60,16 +48,14 @@ def generate_image_hf(prompt):
         if response.status_code == 200:
             image_base64 = base64.b64encode(response.content).decode('utf-8')
             return f"data:image/jpeg;base64,{image_base64}"
+        print(f"Erreur HF: {response.status_code}")
         return None
     except Exception as e:
         print(f"Erreur image: {e}")
         return None
 
-@app.route("/chat", methods=["GET", "POST"])
+@app.route("/chat", methods=["POST"])
 def chat():
-    if request.method == "GET":
-        return jsonify({"error": "POST only"}), 405
-    
     data = request.get_json() or {}
     user_message = data.get("message", "")
     
