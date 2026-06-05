@@ -1,126 +1,50 @@
-const chatContainer = document.getElementById('chat-container');
-const messageInput = document.getElementById('message-input');
-const sendBtn = document.getElementById('send-btn');
+import os
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from groq import Groq
 
-const API_URL = 'https://ia-backend-6mtu.onrender.com/chat';
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-function scrollToChat() {
-    const chatSection = document.getElementById('chat');
-    if (chatSection) {
-        chatSection.scrollIntoView({ behavior: 'smooth' });
-    }
-}
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-function getCurrentTime() {
-    const now = new Date();
-    return now.getHours().toString().padStart(2, '0') + ':' + 
-           now.getMinutes().toString().padStart(2, '0');
-}
+ADAD_FINDER_PERSONALITY = """Tu es l'assistant IA d'AdadFinder.
+Ton rôle est d'aider les utilisateurs à comprendre et utiliser AdadFinder.
+Sois professionnel, courtois et utile.
+Réponds en français de manière claire et concise.
+Si tu ne connais pas la réponse, dis-le honnêtement.
+"""
 
-function addMessage(text, sender, images = []) {
-    const messageDiv = document.createElement('div');
-    messageDiv.className = `message ${sender}`;
-    
-    if (sender === 'bot') {
-        const avatar = document.createElement('div');
-        avatar.className = 'message-avatar';
-        avatar.textContent = '💕';
-        messageDiv.appendChild(avatar);
-    }
-    
-    const contentDiv = document.createElement('div');
-    contentDiv.className = 'message-content';
-    
-    const textDiv = document.createElement('div');
-    textDiv.className = 'message-text';
-    textDiv.innerHTML = text.replace(/\n/g, '<br>');
-    contentDiv.appendChild(textDiv);
-    
-    if (images && images.length > 0) {
-        images.forEach(function(img) {
-            const imgElement = document.createElement('img');
-            imgElement.src = img.url;
-            imgElement.alt = img.description;
-            imgElement.className = 'message-image';
-            imgElement.onclick = function() {
-                window.open(img.url, '_blank');
-            };
-            contentDiv.appendChild(imgElement);
-        });
-    }
-    
-    const timeDiv = document.createElement('div');
-    timeDiv.className = 'message-time';
-    timeDiv.textContent = getCurrentTime();
-    contentDiv.appendChild(timeDiv);
-    
-    messageDiv.appendChild(contentDiv);
-    chatContainer.appendChild(messageDiv);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
-}
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "OK", "message": "AdadFinder AI est en ligne"}), 200
 
-function showTyping() {
-    const typingDiv = document.createElement('div');
-    typingDiv.className = 'message bot';
-    typingDiv.id = 'typing-indicator';
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json() or {}
+    user_message = data.get("message", "")
     
-    const avatar = document.createElement('div');
-    avatar.className = 'message-avatar';
-    avatar.textContent = '💕';
-    typingDiv.appendChild(avatar);
+    if not user_message:
+        return jsonify({"error": "Message vide"}), 400
     
-    const typingContent = document.createElement('div');
-    typingContent.className = 'message-content';
-    typingContent.innerHTML = '<div class="message-text">Sophia écrit...</div>';
-    typingDiv.appendChild(typingContent);
-    
-    chatContainer.appendChild(typingDiv);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
-}
-
-function removeTyping() {
-    const typing = document.getElementById('typing-indicator');
-    if (typing) typing.remove();
-}
-
-async function sendMessage() {
-    const message = messageInput.value.trim();
-    if (!message) return;
-    
-    addMessage(message, 'user');
-    messageInput.value = '';
-    
-    showTyping();
-    
-    try {
-        const response = await fetch(API_URL, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ message: message })
-        });
+    try:
+        r = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": ADAD_FINDER_PERSONALITY},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
         
-        const data = await response.json();
+        reply = r.choices[0].message.content
         
-        removeTyping();
+        return jsonify({"reply": reply})
         
-        if (data.reply) {
-            addMessage(data.reply, 'bot', data.images || []);
-        } else if (data.error) {
-            addMessage('Erreur: ' + data.error, 'bot');
-        }
-    } catch (error) {
-        removeTyping();
-        addMessage('Erreur de connexion. Réessaie plus tard, mon amour. 💕', 'bot');
-    }
-}
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-sendBtn.addEventListener('click', sendMessage);
-messageInput.addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') sendMessage();
-});
-
-window.addEventListener('load', function() {
-    messageInput.focus();
-});
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
