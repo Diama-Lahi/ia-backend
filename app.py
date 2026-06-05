@@ -3,11 +3,18 @@ import re
 import json
 import logging
 import requests
+import io
+import base64
+import random
 from functools import lru_cache
 from collections import defaultdict, deque
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from groq import Groq
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFont
+import arabic_reshaper
+from bidi.algorithm import get_display
 
 # -------------------------------------------------------------------
 # CONFIGURATION
@@ -197,7 +204,6 @@ INDEX_FILE = os.path.join(os.path.dirname(__file__), "verses_abjad_index.json")
 if os.path.exists(INDEX_FILE):
     with open(INDEX_FILE, "r", encoding="utf-8") as f:
         raw_index = json.load(f)
-    # Convertir les clés en entiers
     VERSES_INDEX["oriental"] = {int(k): v for k, v in raw_index.get("oriental", {}).items()}
     VERSES_INDEX["maghribi"] = {int(k): v for k, v in raw_index.get("maghribi", {}).items()}
     logger.info(f"✅ Index Abjad chargé : {len(VERSES_INDEX['oriental'])} valeurs orientales, {len(VERSES_INDEX['maghribi'])} maghrébines")
@@ -399,7 +405,7 @@ def build_context(user_message):
         verses_list = VERSES_INDEX.get(system_order, {}).get(val, [])
         if verses_list:
             context += f"\n\n📖 VERSET(S) AVEC LA VALEUR {val} (système {system_order}) :\n"
-            for v in verses_list[:5]:  # limiter à 5 versets pour ne pas saturer le contexte
+            for v in verses_list[:5]:
                 surah_name = SURAH_NAMES.get(v['surah'], f"Sourate {v['surah']}")
                 context += f"- {surah_name}, verset {v['ayah']} : {v['arabic']}\n"
 
@@ -436,14 +442,22 @@ def build_context(user_message):
     return context, system_order
 
 # -------------------------------------------------------------------
-# ROUTES
+# ROUTES PRINCIPALES (Chat)
 # -------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "OK",
         "message": "AdadFinder AI Assistant est en ligne ☪",
-        "endpoints": ["/chat", "/chat/stream"]
+        "endpoints": [
+            "/chat",
+            "/chat/stream",
+            "/audio/play/<text>",
+            "/calligraphy/<text>",
+            "/analyze/<text>",
+            "/quiz",
+            "/suggest/<message>"
+        ]
     }), 200
 
 @app.route("/chat", methods=["POST"])
@@ -530,8 +544,259 @@ def chat_stream():
     return Response(generate(), mimetype='text/event-stream')
 
 # -------------------------------------------------------------------
+# 🔊 ROUTE AUDIO (Prononciation arabe)
+# -------------------------------------------------------------------
+@app.route("/audio/play/<path:text>", methods=["GET"])
+def play_audio(text):
+    """Retourne directement le fichier audio MP3"""
+    try:
+        text = text.strip()
+        if not text:
+            return jsonify({"error": "Texte vide"}), 400
+        
+        tts = gTTS(text=text, lang='ar', slow=False)
+        audio_buffer = io.BytesIO()
+        tts.write_to_fp(audio_buffer)
+        audio_buffer.seek(0)
+        
+        return Response(audio_buffer.read(), mimetype='audio/mpeg')
+    except Exception as e:
+        logger.error(f"Erreur audio: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# -------------------------------------------------------------------
+# 🎨 ROUTE CALLIGRAPHIE (Génération d'images)
+# -------------------------------------------------------------------
+@app.route("/calligraphy/<path:text>", methods=["GET"])
+def generate_calligraphy(text):
+    """Génère une image calligraphique d'un texte arabe"""
+    try:
+        text = text.strip()
+        if not text:
+            return jsonify({"error": "Texte vide"}), 400
+        
+        # Préparer le texte arabe
+        reshaped_text = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped_text)
+        
+        # Créer une image
+        width, height = 800, 400
+        img = Image.new('RGB', (width, height), color='#f5f5dc')
+        draw = ImageDraw.Draw(img)
+        
+        # Charger une police
+        try:
+            font = ImageFont.truetype("arial.ttf", 80)
+        except:
+            font = ImageFont.load_default()
+        
+        # Centrer le texte
+        bbox = draw.textbbox((0, 0), bidi_text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        x = (width - text_width) / 2
+        y = (height - text_height) / 2
+        
+        # Dessiner
+        draw.text((x, y), bidi_text, font=font, fill='#d4af37')
+        draw.rectangle([10, 10, width-10, height-10], outline='#2d5016', width=3)
+        
+        # Convertir en base64
+        img_buffer = io.BytesIO()
+        img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        img_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
+        
+        return jsonify({
+            "image": img_base64,
+            "text": text,
+            "format": "png"
+        })
+    except Exception as e:
+        logger.error(f"Erreur calligraphie: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/calligraphy/download/<path:text>", methods=["GET"])
+def download_calligraphy(text):
+    """Télécharge directement l'image calligraphique"""
+    try:
+        reshaped_text = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped_text)
+        
+        width, height = 800, 400
+        img = Image.new('RGB', (width, height), color='#f5f5dc')
+        draw = ImageDraw.Draw(img)
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", 80)
+        except:
+            font = ImageFont.load_default()
+        
+        bbox = draw.textbbox((0, 0), bidi_text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        x = (width - text_width) / 2
+        y = (height - text_height) / 2
+        
+        draw.text((x, y), bidi_text, font=font, fill='#d4af37')
+        draw.rectangle([10, 10, width-10, height-10], outline='#2d5016', width=3)
+        
+        img_buffer = io.BytesIO()
+        img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        
+        return Response(img_buffer.read(), mimetype='image/png')
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# -------------------------------------------------------------------
+# 📊 ROUTE ANALYSE (Décomposition lettre par lettre)
+# -------------------------------------------------------------------
+@app.route("/analyze/<path:text>", methods=["GET"])
+def analyze_text(text):
+    """Analyse détaillée d'un texte avec décomposition lettre par lettre"""
+    try:
+        text = text.strip()
+        if not text:
+            return jsonify({"error": "Texte vide"}), 400
+        
+        oriental_result = compute_abjad(text, "oriental")
+        maghribi_result = compute_abjad(text, "maghribi")
+        
+        breakdown = []
+        for char in text:
+            if char in ABJAD_ORIENTAL:
+                breakdown.append({
+                    "letter": char,
+                    "oriental_value": ABJAD_ORIENTAL[char],
+                    "maghribi_value": ABJAD_MAGHRIBI.get(char, ABJAD_ORIENTAL[char])
+                })
+        
+        names_match = find_name_by_text(text)
+        words_match = find_famous_word(text)
+        
+        return jsonify({
+            "text": text,
+            "oriental": {
+                "total": oriental_result["total"],
+                "letters": oriental_result["letters"]
+            },
+            "maghribi": {
+                "total": maghribi_result["total"],
+                "letters": maghribi_result["letters"]
+            },
+            "breakdown": breakdown,
+            "matches": {
+                "names": names_match,
+                "words": words_match
+            }
+        })
+    except Exception as e:
+        logger.error(f"Erreur analyse: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# -------------------------------------------------------------------
+# 🧠 ROUTE QUIZ (Quiz interactif)
+# -------------------------------------------------------------------
+@app.route("/quiz", methods=["GET"])
+def generate_quiz():
+    """Génère un quiz aléatoire sur les valeurs Abjad"""
+    try:
+        quiz_type = random.choice(["name", "word"])
+        
+        if quiz_type == "name":
+            name = random.choice(NAMES_99)
+            question = f"Quelle est la valeur Abjad de {name['arabic']} ({name['trans']}) ?"
+            correct_answer = name["value"]
+        else:
+            word = random.choice(FAMOUS_WORDS)
+            question = f"Quelle est la valeur Abjad de {word['arabic']} ({word['trans']}) ?"
+            correct_answer = word["value"]
+        
+        wrong_answers = []
+        while len(wrong_answers) < 3:
+            wrong = random.randint(correct_answer - 100, correct_answer + 100)
+            if wrong != correct_answer and wrong not in wrong_answers and wrong > 0:
+                wrong_answers.append(wrong)
+        
+        all_answers = [correct_answer] + wrong_answers
+        random.shuffle(all_answers)
+        
+        return jsonify({
+            "question": question,
+            "options": all_answers,
+            "correct_answer": correct_answer,
+            "type": quiz_type
+        })
+    except Exception as e:
+        logger.error(f"Erreur quiz: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/quiz/check", methods=["POST"])
+def check_quiz_answer():
+    """Vérifie la réponse à un quiz"""
+    data = request.get_json() or {}
+    user_answer = data.get("answer")
+    correct_answer = data.get("correct_answer")
+    
+    if user_answer is None or correct_answer is None:
+        return jsonify({"error": "Données manquantes"}), 400
+    
+    is_correct = int(user_answer) == int(correct_answer)
+    message = "✅ Correct ! Barakallahu fik !" if is_correct else f"❌ Incorrect. La bonne réponse était {correct_answer}"
+    
+    return jsonify({
+        "correct": is_correct,
+        "message": message
+    })
+
+# -------------------------------------------------------------------
+# 💡 ROUTE SUGGESTIONS (Suggestions intelligentes)
+# -------------------------------------------------------------------
+@app.route("/suggest/<path:message>", methods=["GET"])
+def get_suggestions(message):
+    """Génère des suggestions de questions basées sur le message"""
+    try:
+        suggestions = []
+        msg_lower = message.lower()
+        
+        if any(word in msg_lower for word in ["valeur", "calcule", "combien"]):
+            suggestions = [
+                "Montre-moi la décomposition lettre par lettre",
+                "Quels noms d'Allah ont la même valeur ?",
+                "Génère une calligraphie de ce mot",
+                "Écouter la prononciation"
+            ]
+        elif any(word in msg_lower for word in ["verset", "coran", "sourate"]):
+            suggestions = [
+                "Montre-moi d'autres versets avec cette valeur",
+                "Quelle est la sourate correspondante ?",
+                "Donne-moi la traduction de ce verset",
+                "Analyse les statistiques de cette sourate"
+            ]
+        elif any(word in msg_lower for word in ["nom", "allah", "99"]):
+            suggestions = [
+                "Montre-moi les 10 premiers noms",
+                "Quel nom a la valeur la plus élevée ?",
+                "Génère un quiz sur les noms d'Allah",
+                "Écouter la prononciation d'un nom"
+            ]
+        else:
+            suggestions = [
+                "Calcule la valeur de محمد",
+                "Quel verset a la valeur 2713 ?",
+                "Donne-moi les 99 noms d'Allah",
+                "Génère un quiz"
+            ]
+        
+        return jsonify({"suggestions": suggestions})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# -------------------------------------------------------------------
 # DÉMARRAGE
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    logger.info(f"🚀 Démarrage du serveur sur le port {port}")
+    app.run(host="0.0.0.0", port=port, debug=True)
