@@ -190,6 +190,21 @@ SURAH_NAMES = {
 }
 
 # -------------------------------------------------------------------
+# CHARGEMENT DE L'INDEX COMPLET DES VERSETS (si disponible)
+# -------------------------------------------------------------------
+VERSES_INDEX = {"oriental": {}, "maghribi": {}}
+INDEX_FILE = os.path.join(os.path.dirname(__file__), "verses_abjad_index.json")
+if os.path.exists(INDEX_FILE):
+    with open(INDEX_FILE, "r", encoding="utf-8") as f:
+        raw_index = json.load(f)
+    # Convertir les clés en entiers
+    VERSES_INDEX["oriental"] = {int(k): v for k, v in raw_index.get("oriental", {}).items()}
+    VERSES_INDEX["maghribi"] = {int(k): v for k, v in raw_index.get("maghribi", {}).items()}
+    logger.info(f"✅ Index Abjad chargé : {len(VERSES_INDEX['oriental'])} valeurs orientales, {len(VERSES_INDEX['maghribi'])} maghrébines")
+else:
+    logger.warning("⚠️ Fichier verses_abjad_index.json introuvable. Recherche par valeur limitée.")
+
+# -------------------------------------------------------------------
 # FONCTIONS UTILITAIRES
 # -------------------------------------------------------------------
 def compute_abjad(text, order="oriental"):
@@ -248,7 +263,7 @@ def search_quran_verses(query):
             data = resp.json()
             if data.get("code") == 200:
                 results = []
-                for match in data["data"]["matches"][:5]:  # limite à 5 versets
+                for match in data["data"]["matches"][:5]:
                     results.append({
                         "surah_num": match["surah"]["number"],
                         "surah_name": match["surah"]["englishName"],
@@ -263,7 +278,7 @@ def search_quran_verses(query):
 # -------------------------------------------------------------------
 # MÉMOIRE DE CONVERSATION (simple, en mémoire)
 # -------------------------------------------------------------------
-sessions = defaultdict(lambda: deque(maxlen=20))  # 20 messages max par session
+sessions = defaultdict(lambda: deque(maxlen=20))
 
 def get_history(session_id):
     return list(sessions.get(session_id, []))
@@ -327,16 +342,8 @@ Rappelle aux utilisateurs qu'ils peuvent utiliser les outils sur https://adadfin
 """
 
 # -------------------------------------------------------------------
-# ROUTES
+# CONSTRUCTION DU CONTEXTE (enrichi avec l'index complet des versets)
 # -------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "status": "OK",
-        "message": "AdadFinder AI Assistant est en ligne ☪",
-        "endpoints": ["/chat", "/chat/stream"]
-    }), 200
-
 def build_context(user_message):
     """Analyse le message utilisateur et enrichit le contexte avec des données structurées"""
     context = ""
@@ -351,7 +358,6 @@ def build_context(user_message):
     calc_match = re.search(r'(?:calcule|valeur(?:s)?\s*(?:abjad|numérique)?\s*(?:de|du|des?)?|combien\s+vaut)\s+(.+)', user_message, re.IGNORECASE)
     if calc_match:
         target = calc_match.group(1).strip()
-        # Si le texte contient de l'arabe, on calcule directement
         arabic_pattern = re.compile(r'[\u0621-\u064A]+')
         arabic_in_target = arabic_pattern.findall(target)
         if arabic_in_target:
@@ -362,7 +368,6 @@ def build_context(user_message):
             context += f"- Oriental: {or_result['total']} ({or_result['letters']} lettres)\n"
             context += f"- Maghrébin: {mg_result['total']} ({mg_result['letters']} lettres)\n"
         else:
-            # On va essayer de trouver des noms célèbres ou des mots
             words = find_famous_word(target)
             if words:
                 for w in words:
@@ -389,6 +394,14 @@ def build_context(user_message):
         surah = get_surah_info(val)
         if surah:
             context += f"\n\n📖 SOURATE {surah['number']}: {surah['name']}\n"
+        
+        # ★ Recherche dans l'index complet des versets
+        verses_list = VERSES_INDEX.get(system_order, {}).get(val, [])
+        if verses_list:
+            context += f"\n\n📖 VERSET(S) AVEC LA VALEUR {val} (système {system_order}) :\n"
+            for v in verses_list[:5]:  # limiter à 5 versets pour ne pas saturer le contexte
+                surah_name = SURAH_NAMES.get(v['surah'], f"Sourate {v['surah']}")
+                context += f"- {surah_name}, verset {v['ayah']} : {v['arabic']}\n"
 
     # 3. Recherche textuelle dans le Coran
     text_search_match = re.search(r'(?:recherche|trouve|cherche|verset.*contenant|mot)\s+(.+)', msg_lower)
@@ -411,7 +424,7 @@ def build_context(user_message):
         abjad_val = compute_abjad(w["arabic"], system_order)["total"]
         context += f"\n\n🌟 MOT CÉLÈBRE: {w['arabic']} ({w['trans']}) = {abjad_val} ({system_order})\n"
 
-    # 6. Détection de sourate par nom (ex: "sourate Ya-Sin")
+    # 6. Détection de sourate par nom
     surah_name_match = re.search(r'(?:sourate|surah|سورة)\s*([a-zA-Zéèêëàâîïôûç\s-]+)', msg_lower, re.IGNORECASE)
     if surah_name_match:
         name_query = surah_name_match.group(1).strip().lower()
@@ -421,6 +434,17 @@ def build_context(user_message):
                 break
 
     return context, system_order
+
+# -------------------------------------------------------------------
+# ROUTES
+# -------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "OK",
+        "message": "AdadFinder AI Assistant est en ligne ☪",
+        "endpoints": ["/chat", "/chat/stream"]
+    }), 200
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -433,23 +457,14 @@ def chat():
 
     logger.info(f"💬 [{session_id}] Question: {user_message[:50]}...")
 
-    # Construire le contexte enrichi
     context, system_order = build_context(user_message)
-
-    # Récupérer l'historique de la session
     history = get_history(session_id)
 
-    # Construire les messages pour le LLM
     messages = [{"role": "system", "content": ADAD_FINDER_PERSONALITY}]
-
-    # Insérer les 6 derniers échanges (3 paires Q/R) pour la mémoire
     for h in history[-6:]:
         messages.append({"role": h["role"], "content": h["content"]})
-
-    # Ajouter le contexte enrichi comme message système supplémentaire
     if context:
-        messages.append({"role": "system", "content": f"📋 CONTEXTE ACTUEL (issu d'AdadFinder) :{context}"})
-
+        messages.append({"role": "system", "content": f"📋 CONTEXTE ACTUEL :{context}"})
     messages.append({"role": "user", "content": user_message})
 
     try:
@@ -462,12 +477,10 @@ def chat():
         reply = r.choices[0].message.content
         logger.info(f"✅ [{session_id}] Réponse générée")
 
-        # Sauvegarder dans l'historique
         add_to_history(session_id, "user", user_message)
         add_to_history(session_id, "assistant", reply)
 
         return jsonify({"reply": reply, "session_id": session_id})
-
     except Exception as e:
         logger.error(f"❌ Erreur: {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -506,7 +519,6 @@ def chat_stream():
                 if token:
                     full_reply += token
                     yield f"data: {json.dumps({'token': token})}\n\n"
-            # Sauvegarder dans l'historique après la fin du stream
             add_to_history(session_id, "user", user_message)
             add_to_history(session_id, "assistant", full_reply)
             yield "data: [DONE]\n\n"
