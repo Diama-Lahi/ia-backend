@@ -1,4 +1,9 @@
-flask
-groq
-flask-cors
-httpx
+flask==3.0.0
+flask-cors==4.0.0
+groq==0.4.2
+requests==2.31.0
+python-dotenv==1.0.0
+gTTS==2.3.2
+Pillow==10.1.0
+arabic-reshaper==3.0.0
+python-bidi==0.4.2
