@@ -1,10 +1,17 @@
 import os
 import re
+import json
 import logging
-from flask import Flask, request, jsonify
+import requests
+from functools import lru_cache
+from collections import defaultdict, deque
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from groq import Groq
 
+# -------------------------------------------------------------------
+# CONFIGURATION
+# -------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -13,7 +20,9 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# ─── DONNÉES ABJAD INTÉGRÉES ─────────────────────────
+# -------------------------------------------------------------------
+# BASES DE DONNÉES ABJAD
+# -------------------------------------------------------------------
 ABJAD_ORIENTAL = {
     'ا':1,'أ':1,'إ':1,'آ':1,'ٱ':1,
     'ب':2,'ت':400,'ث':500,'ج':3,'ح':8,'خ':600,
@@ -180,7 +189,9 @@ SURAH_NAMES = {
     111:"Al-Masad",112:"Al-Ikhlas",113:"Al-Falaq",114:"An-Nas"
 }
 
-# ─── FONCTIONS DE CALCUL ─────────────────────────────
+# -------------------------------------------------------------------
+# FONCTIONS UTILITAIRES
+# -------------------------------------------------------------------
 def compute_abjad(text, order="oriental"):
     """Calcule la valeur Abjad d'un texte arabe"""
     abjad_map = ABJAD_MAGHRIBI if order == "maghribi" else ABJAD_ORIENTAL
@@ -194,20 +205,26 @@ def compute_abjad(text, order="oriental"):
 
 def find_name_by_value(value):
     """Trouve les noms d'Allah correspondant à une valeur"""
-    results = [n for n in NAMES_99 if n["value"] == value]
+    return [n for n in NAMES_99 if n["value"] == value]
+
+def find_name_by_text(text):
+    """Trouve un nom d'Allah par son nom arabe ou translittéré"""
+    results = []
+    for n in NAMES_99:
+        if (text.lower() in n["trans"].lower() or
+            text in n["arabic"] or
+            n["trans"].lower() in text.lower()):
+            results.append(n)
     return results
 
 def find_famous_word(query):
     """Recherche un mot célèbre par nom ou valeur"""
     results = []
     query_lower = query.lower().strip()
-    
-    # Recherche par valeur numérique
     if query_lower.isdigit():
         val = int(query_lower)
         results = [w for w in FAMOUS_WORDS if w["value"] == val]
     else:
-        # Recherche par texte
         for w in FAMOUS_WORDS:
             if (query_lower in w["arabic"] or 
                 query_lower in w["trans"].lower() or
@@ -217,12 +234,46 @@ def find_famous_word(query):
     return results
 
 def get_surah_info(number):
-    """Retourne les infos d'une sourate"""
     if number in SURAH_NAMES:
         return {"number": number, "name": SURAH_NAMES[number]}
     return None
 
-# ─── PERSONNALITÉ DE L'ASSISTANT ─────────────────────
+@lru_cache(maxsize=100)
+def search_quran_verses(query):
+    """Recherche des versets par mot-clé via l'API Al-Quran Cloud (cache activé)"""
+    url = f"https://api.alquran.cloud/v1/search/{query}/all/en.asad"
+    try:
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 200:
+                results = []
+                for match in data["data"]["matches"][:5]:  # limite à 5 versets
+                    results.append({
+                        "surah_num": match["surah"]["number"],
+                        "surah_name": match["surah"]["englishName"],
+                        "ayah": match["ayahInSurah"],
+                        "text": match["text"]
+                    })
+                return results
+    except Exception as e:
+        logger.error(f"Erreur recherche Coran: {e}")
+    return []
+
+# -------------------------------------------------------------------
+# MÉMOIRE DE CONVERSATION (simple, en mémoire)
+# -------------------------------------------------------------------
+sessions = defaultdict(lambda: deque(maxlen=20))  # 20 messages max par session
+
+def get_history(session_id):
+    return list(sessions.get(session_id, []))
+
+def add_to_history(session_id, role, content):
+    sessions[session_id].append({"role": role, "content": content})
+
+# -------------------------------------------------------------------
+# PERSONNALITÉ DE L'ASSISTANT
+# -------------------------------------------------------------------
 ADAD_FINDER_PERSONALITY = """Tu es l'assistant IA officiel d'AdadFinder.com, un site islamique spécialisé dans le calcul Abjad (poids mystique des lettres arabes).
 
 🎯 TON RÔLE :
@@ -250,9 +301,14 @@ Tu aides les utilisateurs à comprendre et utiliser AdadFinder. Tu es expert en 
 - Utilise des emojis islamiques appropriés : ☪ 🕌 📖 ⭐ 🌙
 - Commence par "As-salamu alaykum" si l'utilisateur salue
 - Sois concis mais précis
-- Si on te demande de calculer une valeur Abjad, utilise les données fournies dans le contexte
-- Si on te demande un nom d'Allah, donne sa valeur
-- Si on te demande une sourate, donne son numéro et son nom
+- Ne calcule jamais une valeur Abjad toi-même ; utilise les données contextuelles fournies
+- Ne donne jamais de versets du Coran que tu ne trouves pas dans le contexte
+- Si une information n'est pas dans le contexte, dis-le honnêtement
+
+🔍 UTILISATION DU CONTEXTE :
+- Le contexte peut contenir des résultats de calcul, des noms, des versets
+- Cite précisément ces données dans ta réponse
+- Si plusieurs systèmes Abjad sont donnés, précise lequel est utilisé
 
 ⚠️ RÈGLES :
 - Ne donne JAMAIS de conseils religieux personnels (fatwa, etc.)
@@ -270,108 +326,200 @@ Rappelle aux utilisateurs qu'ils peuvent utiliser les outils sur https://adadfin
 - Analyser des statistiques
 """
 
+# -------------------------------------------------------------------
+# ROUTES
+# -------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "OK",
         "message": "AdadFinder AI Assistant est en ligne ☪",
-        "endpoints": ["/chat"]
+        "endpoints": ["/chat", "/chat/stream"]
     }), 200
 
-@app.route("/chat", methods=["POST"])
-def chat():
-    data = request.get_json() or {}
-    user_message = data.get("message", "")
-    
-    if not user_message:
-        return jsonify({"error": "Message vide"}), 400
-    
-    logger.info(f"💬 Question: {user_message[:50]}...")
-    
-    # ─── CONTEXTE ENRICHI ────────────────────────────
+def build_context(user_message):
+    """Analyse le message utilisateur et enrichit le contexte avec des données structurées"""
     context = ""
-    
-    # Détection de calcul Abjad
-    arabic_pattern = re.compile(r'[\u0621-\u064A]+')
-    arabic_matches = arabic_pattern.findall(user_message)
-    
-    if arabic_matches:
-        arabic_text = ' '.join(arabic_matches)
-        or_result = compute_abjad(arabic_text, "oriental")
-        mg_result = compute_abjad(arabic_text, "maghribi")
-        context += f"\n\n📊 CALCUL AUTOMATIQUE pour '{arabic_text}':\n"
-        context += f"- Ordre Oriental: {or_result['total']} ({or_result['letters']} lettres)\n"
-        context += f"- Ordre Maghrébin: {mg_result['total']} ({mg_result['letters']} lettres)\n"
-    
-    # Détection de nombre (recherche de valeur)
+    msg_lower = user_message.lower()
+
+    # Détection du système Abjad souhaité
+    system_order = "oriental"
+    if "maghrébin" in msg_lower or "maghribi" in msg_lower:
+        system_order = "maghribi"
+
+    # 1. Détection de demande de calcul explicite
+    calc_match = re.search(r'(?:calcule|valeur(?:s)?\s*(?:abjad|numérique)?\s*(?:de|du|des?)?|combien\s+vaut)\s+(.+)', user_message, re.IGNORECASE)
+    if calc_match:
+        target = calc_match.group(1).strip()
+        # Si le texte contient de l'arabe, on calcule directement
+        arabic_pattern = re.compile(r'[\u0621-\u064A]+')
+        arabic_in_target = arabic_pattern.findall(target)
+        if arabic_in_target:
+            text_to_calc = ' '.join(arabic_in_target)
+            or_result = compute_abjad(text_to_calc, "oriental")
+            mg_result = compute_abjad(text_to_calc, "maghribi")
+            context += f"\n\n📊 CALCUL ABJAD pour '{text_to_calc}':\n"
+            context += f"- Oriental: {or_result['total']} ({or_result['letters']} lettres)\n"
+            context += f"- Maghrébin: {mg_result['total']} ({mg_result['letters']} lettres)\n"
+        else:
+            # On va essayer de trouver des noms célèbres ou des mots
+            words = find_famous_word(target)
+            if words:
+                for w in words:
+                    abjad_val = compute_abjad(w["arabic"], system_order)["total"]
+                    context += f"\n\n🌟 MOT CÉLÈBRE: {w['arabic']} ({w['trans']}) = {abjad_val} ({system_order})\n"
+
+    # 2. Recherche par valeur numérique (si un nombre est présent)
     numbers = re.findall(r'\b(\d+)\b', user_message)
     for num in numbers:
         val = int(num)
+        # Chercher dans les noms d'Allah
         names = find_name_by_value(val)
         if names:
             context += f"\n\n⭐ NOMS D'ALLAH avec valeur {val}:\n"
             for n in names:
                 context += f"- {n['arabic']} ({n['trans']}) = {n['value']}\n"
-        
+        # Chercher dans les mots célèbres
         words = find_famous_word(num)
         if words:
             context += f"\n\n🌟 MOTS CÉLÈBRES avec valeur {val}:\n"
             for w in words:
                 context += f"- {w['arabic']} ({w['trans']}) = {w['value']}\n"
-    
-    # Détection de recherche de mot célèbre
-    for word in FAMOUS_WORDS:
-        if (word["trans"].lower() in user_message.lower() or 
-            word["arabic"] in user_message):
-            context += f"\n\n🌟 MOT CÉLÈBRE TROUVÉ:\n"
-            context += f"- {word['arabic']} ({word['trans']}) = {word['value']}\n"
-    
-    # Détection de recherche de nom d'Allah
-    for name in NAMES_99:
-        if (name["trans"].lower() in user_message.lower() or
-            name["arabic"] in user_message):
-            context += f"\n\n⭐ NOM D'ALLAH TROUVÉ:\n"
-            context += f"- {name['arabic']} ({name['trans']}) = {name['value']}\n"
-    
-    # Détection de numéro de sourate
-    sourah_match = re.search(r'(?:sourate|surah|سورة)\s*(\d+)', user_message.lower())
-    if sourah_match:
-        num = int(sourah_match.group(1))
-        info = get_surah_info(num)
-        if info:
-            context += f"\n\n📖 SOURATE {info['number']}:\n"
-            context += f"- Nom: {info['name']}\n"
-    
-    # ─── APPEL À GROQ ────────────────────────────────
+        # Chercher une sourate par numéro
+        surah = get_surah_info(val)
+        if surah:
+            context += f"\n\n📖 SOURATE {surah['number']}: {surah['name']}\n"
+
+    # 3. Recherche textuelle dans le Coran
+    text_search_match = re.search(r'(?:recherche|trouve|cherche|verset.*contenant|mot)\s+(.+)', msg_lower)
+    if text_search_match:
+        query = text_search_match.group(1).strip()
+        verses = search_quran_verses(query)
+        if verses:
+            context += f"\n\n📖 RÉSULTATS DE RECHERCHE POUR '{query}':\n"
+            for v in verses:
+                context += f"- S{v['surah_num']}:{v['ayah']} ({v['surah_name']}): {v['text']}\n"
+
+    # 4. Recherche de nom d'Allah par texte
+    name_matches = find_name_by_text(user_message)
+    for name in name_matches:
+        context += f"\n\n⭐ NOM D'ALLAH TROUVÉ: {name['arabic']} ({name['trans']}) = {name['value']}\n"
+
+    # 5. Recherche de mots célèbres par texte
+    word_matches = find_famous_word(user_message)
+    for w in word_matches:
+        abjad_val = compute_abjad(w["arabic"], system_order)["total"]
+        context += f"\n\n🌟 MOT CÉLÈBRE: {w['arabic']} ({w['trans']}) = {abjad_val} ({system_order})\n"
+
+    # 6. Détection de sourate par nom (ex: "sourate Ya-Sin")
+    surah_name_match = re.search(r'(?:sourate|surah|سورة)\s*([a-zA-Zéèêëàâîïôûç\s-]+)', msg_lower, re.IGNORECASE)
+    if surah_name_match:
+        name_query = surah_name_match.group(1).strip().lower()
+        for num, sname in SURAH_NAMES.items():
+            if name_query in sname.lower():
+                context += f"\n\n📖 SOURATE {num}: {sname}\n"
+                break
+
+    return context, system_order
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json() or {}
+    user_message = data.get("message", "").strip()
+    session_id = data.get("session_id", "default")
+
+    if not user_message:
+        return jsonify({"error": "Message vide"}), 400
+
+    logger.info(f"💬 [{session_id}] Question: {user_message[:50]}...")
+
+    # Construire le contexte enrichi
+    context, system_order = build_context(user_message)
+
+    # Récupérer l'historique de la session
+    history = get_history(session_id)
+
+    # Construire les messages pour le LLM
+    messages = [{"role": "system", "content": ADAD_FINDER_PERSONALITY}]
+
+    # Insérer les 6 derniers échanges (3 paires Q/R) pour la mémoire
+    for h in history[-6:]:
+        messages.append({"role": h["role"], "content": h["content"]})
+
+    # Ajouter le contexte enrichi comme message système supplémentaire
+    if context:
+        messages.append({"role": "system", "content": f"📋 CONTEXTE ACTUEL (issu d'AdadFinder) :{context}"})
+
+    messages.append({"role": "user", "content": user_message})
+
     try:
-        messages = [
-            {"role": "system", "content": ADAD_FINDER_PERSONALITY}
-        ]
-        
-        if context:
-            messages.append({
-                "role": "system", 
-                "content": f"📋 DONNÉES CONTEXTUELLES (utilise ces informations pour répondre) :{context}"
-            })
-        
-        messages.append({"role": "user", "content": user_message})
-        
         r = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
             temperature=0.7,
             max_tokens=600
         )
-        
         reply = r.choices[0].message.content
-        logger.info(f"✅ Réponse générée")
-        
-        return jsonify({"reply": reply})
-        
+        logger.info(f"✅ [{session_id}] Réponse générée")
+
+        # Sauvegarder dans l'historique
+        add_to_history(session_id, "user", user_message)
+        add_to_history(session_id, "assistant", reply)
+
+        return jsonify({"reply": reply, "session_id": session_id})
+
     except Exception as e:
         logger.error(f"❌ Erreur: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/chat/stream", methods=["POST"])
+def chat_stream():
+    data = request.get_json() or {}
+    user_message = data.get("message", "").strip()
+    session_id = data.get("session_id", "default")
+
+    if not user_message:
+        return jsonify({"error": "Message vide"}), 400
+
+    context, system_order = build_context(user_message)
+    history = get_history(session_id)
+
+    messages = [{"role": "system", "content": ADAD_FINDER_PERSONALITY}]
+    for h in history[-6:]:
+        messages.append({"role": h["role"], "content": h["content"]})
+    if context:
+        messages.append({"role": "system", "content": f"📋 CONTEXTE ACTUEL :{context}"})
+    messages.append({"role": "user", "content": user_message})
+
+    def generate():
+        full_reply = ""
+        try:
+            completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=600,
+                stream=True
+            )
+            for chunk in completion:
+                token = chunk.choices[0].delta.content or ""
+                if token:
+                    full_reply += token
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+            # Sauvegarder dans l'historique après la fin du stream
+            add_to_history(session_id, "user", user_message)
+            add_to_history(session_id, "assistant", full_reply)
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"❌ Erreur streaming: {str(e)}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+# -------------------------------------------------------------------
+# DÉMARRAGE
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
